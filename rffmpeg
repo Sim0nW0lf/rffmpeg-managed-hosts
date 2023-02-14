@@ -26,6 +26,7 @@ import os
 import signal
 import sys
 import yaml
+import glob
 
 from contextlib import contextmanager
 from grp import getgrnam
@@ -935,6 +936,30 @@ def run_control(config):
     return rffmpeg_click(obj={})
 
 
+def redirect_4k(ffmpeg_args):
+    uhdTranscode = ["2160p", "/transcodes/"]
+    if all(x in ' '.join(ffmpeg_args) for x in uhdTranscode) and "json" not in uhdTranscode:
+        path_index = ffmpeg_args.index("-i") + 1
+        path = ffmpeg_args[path_index][5:]
+        path = path.replace("gmedia4k", "gmedia")
+        if "Filme" in path:
+            path = path.replace("4kFilme", "1080pFilme")
+            file_index = path.rfind("/") + 1
+            #find 1080p Movie file, write it to Jellyfin Input
+            for path_new in glob.glob( path[:file_index] + "*1080p*" + path[-3:] ):
+                ffmpeg_args[path_index] = "file:" + path_new
+        else:
+            file_index = path.rfind("/") + 1
+            file = path[file_index:]
+            #find 1080p Series file, write it to Jellyfin Input
+            val = -1
+            for i in range(0, 2):
+                val = file.find("-", val + 1)
+            for path_new in glob.glob( path[:file_index] + file[:val-1] + "*1080p*" + path[-3:] ):
+                ffmpeg_args[path_index] = "file:" + path_new
+    return ffmpeg_args
+
+
 # Entrypoint
 if __name__ == "__main__":
     all_args = sys.argv
@@ -948,4 +973,5 @@ if __name__ == "__main__":
 
     else:
         ffmpeg_args = all_args[1:]
+        ffmpeg_args = redirect_4k(ffmpeg_args)
         run_ffmpeg(config, ffmpeg_args)

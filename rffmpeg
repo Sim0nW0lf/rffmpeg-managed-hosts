@@ -299,7 +299,7 @@ def run_command(command, stdin, stdout, stderr):
     return p
 
 
-def get_target_host(config):
+def get_target_host(config, ffmpeg_args):
     """
     Determine an optimal target host via data on currently active processes and states.
     """
@@ -345,12 +345,21 @@ def get_target_host(config):
     target_hid = None
     target_hostname = None
     target_servername = None
+    target_has_transcodes = "/transcodes/" in ' '.join(ffmpeg_args)
     # For each host in the mapping, let's determine if it is suitable
     for hid, host in host_mappings.items():
         log.debug(f"Trying host ID {hid} '{host['hostname']}'")
         # If it's marked as bad, continue
         if host["current_state"] == "bad":
             log.debug(f"Host previously marked bad by PID {host['marking_pid']}")
+            continue
+        # Streams should NOT be played form "Filme-Server"
+        if host["hostname"] == "Filme-Server" and target_has_transcodes:
+            log.debug(f"Skipping Filme-Server, since transcodes are requested")
+            continue
+        # Every host other than "Filme-Server" should ONLY transcode streams
+        elif host["hostname"] != "Filme-Server" and not target_has_transcodes:
+            log.debug(f"Skipping {host['hostname']}, since no transcodes are requested")
             continue
 
         # Try to connect to the host and run a very quick command to determine if it is workable
@@ -527,7 +536,7 @@ def run_ffmpeg(config, ffmpeg_args):
 
     log.info(f"Starting rffmpeg as {cmd_name} with args: {' '.join(ffmpeg_args)}")
 
-    target_hid, target_hostname, target_servername = get_target_host(config)
+    target_hid, target_hostname, target_servername = get_target_host(config, ffmpeg_args)
 
     if not target_hostname or target_hostname == "localhost":
         ret = run_local_ffmpeg(config, ffmpeg_args)

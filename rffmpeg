@@ -25,6 +25,7 @@ import logging
 import os
 import signal
 import sys
+import shlex
 import yaml
 import glob
 
@@ -47,6 +48,7 @@ log = logging.getLogger("rffmpeg")
 DB_TYPE = "SQLITE"
 SQL_VAR_SIGN = "?"
 SQL_PRIMARY_KEY="INTEGER"
+SQL_DATE_TIME="DATETIME"
 POSTGRES_DB = os.environ.get("RFFMPEG_POSTGRES_DB", "rffmpeg")
 POSTGRES_USER = os.environ.get("RFFMPEG_POSTGRES_USER")
 POSTGRES_PASS = os.environ.get("RFFMPEG_POSTGRES_PASS", "")
@@ -57,6 +59,7 @@ if POSTGRES_USER != None:
     DB_TYPE = "POSTGRES"
     SQL_VAR_SIGN = "%s"
     SQL_PRIMARY_KEY="SERIAL"
+    SQL_DATE_TIME="TIMESTAMP"
     POSTGRES_CREDENTIALS = {
         "dbname": POSTGRES_DB,
         "user": POSTGRES_USER,
@@ -182,7 +185,7 @@ def load_config():
     config["dir_group"] = config_directories.get("group", "sudo")
 
     # Parse the keys from the remote group
-    config["remote_user"] = config_remote.get("user", "jellyfin")
+    config["remote_user"] = config_remote.get("user", "")
     config["remote_args"] = config_remote.get(
         "args", ["-i", "/var/lib/jellyfin/.ssh/id_rsa"]
     )
@@ -314,7 +317,7 @@ def get_target_host(config, ffmpeg_args):
     # Generate a mapping dictionary of hosts and processes
     host_mappings = dict()
     for host in hosts:
-        hid, hostname, weight, servername = host
+        hid, servername, hostname, weight, created = host
 
         # Get the latest state
         with dbconn(config) as cur:
@@ -328,8 +331,9 @@ def get_target_host(config, ffmpeg_args):
             current_state = "idle"
             marking_pid = "N/A"
         else:
-            current_state = current_state[3]
-            marking_pid = current_state[2]
+            sid, host_id, process_id, state = current_state
+            current_state = state
+            marking_pid = process_id
 
         # Create the mappings entry
         host_mappings[hid] = {
@@ -367,6 +371,7 @@ def get_target_host(config, ffmpeg_args):
             log.debug("Running SSH test")
             test_ssh_command = generate_ssh_command(config, host["hostname"])
             test_ssh_command.remove("-q")
+            test_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in test_ssh_command]
             test_ffmpeg_command = [config["ffmpeg_command"], "-version"]
             ret = run_command(test_ssh_command + test_ffmpeg_command, PIPE, PIPE, PIPE)
             if ret.returncode != 0:
@@ -407,48 +412,98 @@ def get_target_host(config, ffmpeg_args):
     return target_hid, target_hostname, target_servername
 
 
-def run_local_ffmpeg(config, ffmpeg_args):
+def run_local_command(config, command, command_args, stderr_as_stdout = False, mapped_cmd = None):
     """
-    Run ffmpeg locally, either because "localhost" is the target host, or because no good target
+    Run command locally, either because "localhost" is the target host, or because no good target
     host was found by get_target_host().
     """
-    rffmpeg_ffmpeg_command = list()
+    rffmpeg_command = [mapped_cmd or command]
 
     # Prepare our default stdin/stdout/stderr
     stdin = sys.stdin
     stderr = sys.stderr
 
-    if "ffprobe" in cmd_name:
-        # If we're in ffprobe mode use that command and sys.stdout as stdout
-        rffmpeg_ffmpeg_command.append(config["fallback_ffprobe_command"])
-        stdout = sys.stdout
-    else:
-        # Otherwise, we use stderr as stdout
-        rffmpeg_ffmpeg_command.append(config["fallback_ffmpeg_command"])
+    if stderr_as_stdout:
         stdout = sys.stderr
-
-    # Check for special flags that override the default stdout
-    if any(item in config["special_flags"] for item in ffmpeg_args):
+    else:
         stdout = sys.stdout
 
     # Append all the passed arguments directly
-    for arg in ffmpeg_args:
-        rffmpeg_ffmpeg_command.append(f"{arg}")
+    for arg in command_args:
+        rffmpeg_command.append(f"{arg}")
 
     log.info("Running command on host 'localhost'")
-    log.debug(f"Local command: {' '.join(rffmpeg_ffmpeg_command)}")
+    log.debug(f"Local command: {' '.join(rffmpeg_command)}")
 
     with dbconn(config) as cur:
         cur.execute(
             f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (0, config["current_pid"], cmd_name + ' ' + ' '.join(ffmpeg_args)),
+            (0, config["current_pid"], command + ' ' + ' '.join(command_args)),
         )
         cur.execute(
             f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
             (0, config["current_pid"], "active"),
         )
 
-    return run_command(rffmpeg_ffmpeg_command, stdin, stdout, stderr)
+    return run_command(rffmpeg_command, stdin, stdout, stderr)
+
+
+def run_local_ffmpeg(config, ffmpeg_args):
+    """
+    Run ffmpeg locally, either because "localhost" is the target host, or because no good target
+    host was found by get_target_host().
+    """
+    if "ffprobe" in cmd_name:
+        return run_local_command(config, cmd_name, ffmpeg_args, mapped_cmd=config["fallback_ffprobe_command"])
+    else:
+        return run_local_command(config, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["fallback_ffmpeg_command"])
+
+
+def run_remote_command(
+    config, target_hid, target_hostname, target_servername, command, command_args, stderr_as_stdout = False, mapped_cmd = None, pre_commands = []
+):
+    """
+    Run command against the remote target_hostname.
+    """
+    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
+    rffmpeg_ssh_command = [arg.replace('@', '', 1) if arg.startswith('@') else arg for arg in rffmpeg_ssh_command]
+ 
+    rffmpeg_command = list()
+
+    # Add any pre commands
+    for cmd in pre_commands:
+        if cmd:
+            rffmpeg_command.append(cmd)
+
+    rffmpeg_command.append(mapped_cmd or command)
+
+    # Prepare our default stdin/stderr
+    stdin = sys.stdin
+    stderr = sys.stderr
+
+    if stderr_as_stdout:
+        stdout = sys.stderr
+    else:
+        stdout = sys.stdout
+    
+    rffmpeg_command.extend(map(shlex.quote, command_args))
+
+    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
+    log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_command)}")
+
+    with dbconn(config) as cur:
+        cur.execute(
+            f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
+            (target_hid, config["current_pid"], command + ' ' + ' '.join(command_args)),
+        )
+        cur.execute(
+            f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
+            (target_hid, config["current_pid"], "active"),
+        )
+
+    return run_command(
+        rffmpeg_ssh_command + rffmpeg_command, stdin, stdout, stderr
+    )
 
 
 def run_remote_ffmpeg(
@@ -457,66 +512,18 @@ def run_remote_ffmpeg(
     """
     Run ffmpeg against the remote target_hostname.
     """
-    rffmpeg_ssh_command = generate_ssh_command(config, target_hostname)
-    rffmpeg_ffmpeg_command = list()
-
-    # Add any pre commands
-    for cmd in config["pre_commands"]:
-        if cmd:
-            rffmpeg_ffmpeg_command.append(cmd)
-
-    # Prepare our default stdin/stderr
-    stdin = sys.stdin
-    stderr = sys.stderr
-
     if "ffprobe" in cmd_name:
         # If we're in ffprobe mode use that command and sys.stdout as stdout
-        rffmpeg_ffmpeg_command.append(config["ffprobe_command"])
-        stdout = sys.stdout
+        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, mapped_cmd=config["ffprobe_command"], pre_commands=config["pre_commands"])
     else:
         # Otherwise, we use stderr as stdout
-        rffmpeg_ffmpeg_command.append(config["ffmpeg_command"])
-        stdout = sys.stderr
-
-    # Check for special flags that override the default stdout
-    if any(item in config["special_flags"] for item in ffmpeg_args):
-        stdout = sys.stdout
-
-    # Append all the passed arguments with requoting of any problematic characters
-    for arg in ffmpeg_args:
-        # Match bad shell characters: * ' ( ) | [ ] or whitespace
-        if search("[*'()|\[\]\s]", arg):
-            rffmpeg_ffmpeg_command.append(f'"{arg}"')
-        else:
-            rffmpeg_ffmpeg_command.append(f"{arg}")
-
-    log.info(f"Running command on host '{target_hostname}' ({target_servername})")
-    log.debug(f"Remote command: {' '.join(rffmpeg_ssh_command + rffmpeg_ffmpeg_command)}")
-
-    with dbconn(config) as cur:
-        cur.execute(
-            f"INSERT INTO processes (host_id, process_id, cmd) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], cmd_name + ' ' + ' '.join(ffmpeg_args)),
-        )
-        cur.execute(
-            f"INSERT INTO states (host_id, process_id, state) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-            (target_hid, config["current_pid"], "active"),
-        )
-
-    return run_command(
-        rffmpeg_ssh_command + rffmpeg_ffmpeg_command, stdin, stdout, stderr
-    )
+        return run_remote_command(config, target_hid, target_hostname, target_servername, cmd_name, ffmpeg_args, stderr_as_stdout=not any(item in config["special_flags"] for item in ffmpeg_args), mapped_cmd=config["ffmpeg_command"], pre_commands=config["pre_commands"])
 
 
-def run_ffmpeg(config, ffmpeg_args):
+def setup_logging(config):
     """
-    Entrypoint for an ffmpeg/ffprobe aliased process.
+    Set up logging.
     """
-    signal.signal(signal.SIGTERM, cleanup)
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGQUIT, cleanup)
-    signal.signal(signal.SIGHUP, cleanup)
-
     if config["logdebug"] is True:
         logging_level = logging.DEBUG
     else:
@@ -533,6 +540,22 @@ def run_ffmpeg(config, ffmpeg_args):
             level=logging_level,
             format="%(asctime)s - %(name)s[%(process)s] - %(levelname)s - %(message)s",
         )
+
+
+def hook_signals():
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGQUIT, cleanup)
+    signal.signal(signal.SIGHUP, cleanup)
+
+
+def run_ffmpeg(config, ffmpeg_args):
+    """
+    Entrypoint for an ffmpeg/ffprobe aliased process.
+    """
+    hook_signals()
+
+    setup_logging(config)
 
     log.info(f"Starting rffmpeg as {cmd_name} with args: {' '.join(ffmpeg_args)}")
 
@@ -588,10 +611,11 @@ def run_control(config):
             with dbconn(config) as cur:
                 cur.execute("SELECT * FROM hosts")
                 for host in cur.fetchall():
-                    if host[3] == "invalid":
+                    hid, servername, hostname, weight, created = host
+                    if servername == "invalid":
                         cur.execute(
                             f"UPDATE hosts SET servername = {SQL_VAR_SIGN} WHERE hostname = {SQL_VAR_SIGN}",
-                            (host[1], host[1]),
+                            (hostname, hostname),
                         )
 
     @click.command(name="init", short_help="Initialize the system.")
@@ -636,7 +660,7 @@ def run_control(config):
                 cur.execute("DROP TABLE IF EXISTS hosts")
                 cur.execute("DROP TABLE IF EXISTS processes")
                 cur.execute("DROP TABLE IF EXISTS states")
-                cur.execute(f"CREATE TABLE hosts (id {SQL_PRIMARY_KEY} PRIMARY KEY, hostname TEXT NOT NULL, weight INTEGER DEFAULT 1, servername TEXT NOT NULL)")
+                cur.execute(f"CREATE TABLE hosts (id {SQL_PRIMARY_KEY} PRIMARY KEY, servername TEXT NOT NULL UNIQUE, hostname TEXT NOT NULL, weight INTEGER DEFAULT 1, created {SQL_DATE_TIME} NOT NULL)")
                 cur.execute(f"CREATE TABLE processes (id {SQL_PRIMARY_KEY} PRIMARY KEY, host_id INTEGER, process_id INTEGER, cmd TEXT)")
                 cur.execute(f"CREATE TABLE states (id {SQL_PRIMARY_KEY} PRIMARY KEY, host_id INTEGER, process_id INTEGER, state TEXT)")
         except Exception as e:
@@ -674,7 +698,8 @@ def run_control(config):
         # Determine if there are any fallback processes running
         fallback_processes = list()
         for process in processes:
-            if process[1] == 0:
+            pid, host_id, process_id, cmd = process
+            if host_id == 0:
                 fallback_processes.append(process)
 
         # Generate a mapping dictionary of hosts and processes
@@ -690,7 +715,7 @@ def run_control(config):
             }
 
         for host in hosts:
-            hid, hostname, weight, servername = host
+            hid, servername, hostname, weight, created = host
 
             # Get the latest state
             with dbconn(config) as cur:
@@ -703,7 +728,8 @@ def run_control(config):
             if not current_state:
                 current_state = "idle"
             else:
-                current_state = current_state[3]
+                sid, host_id, process_id, state = current_state
+                current_state = state
 
             # Create the mappings entry
             host_mappings[hid] = {
@@ -820,13 +846,14 @@ def run_control(config):
         """
         Add a new host with IP or hostname HOST to the database.
         """
+        created = datetime.now()
         if name is None:
             name = host
         click.echo(f"Adding new host '{host}' ({name})")
         with dbconn(config) as cur:
             cur.execute(
-                f"INSERT INTO hosts (hostname, weight, servername) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
-                (host, weight, name),
+                f"INSERT INTO hosts (servername, hostname, weight, created) VALUES ({SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN}, {SQL_VAR_SIGN})",
+                (name, host, weight, created),
             )
 
     rffmpeg_click.add_command(rffmpeg_click_add)
@@ -860,11 +887,53 @@ def run_control(config):
             else:
                 click.echo(f"Removing {len(entry)} hosts:")
             for host in entry:
-                hid, hostname, weight, servername = host
+                hid, servername, hostname, weight, created = host
                 click.echo(f"\tID: {hid}\tHostname: {hostname}\tServername: {servername}")
                 cur.execute(f"DELETE FROM hosts WHERE id = {SQL_VAR_SIGN}", (hid,))
 
     rffmpeg_click.add_command(rffmpeg_click_remove)
+
+    @click.command(name="run", short_help="Run a command.", context_settings={
+        "ignore_unknown_options": True
+    })
+    @click.option("--stderr-as-stdout", "stderr_as_stdout", is_flag=True, default=False, help="Use stderr as stdout for the command.")
+    @click.argument('full_command', nargs=-1, type=click.UNPROCESSED)
+    def rffmpeg_click_run(stderr_as_stdout, full_command):
+        """
+        Run a command on the optimal host.
+        """
+        hook_signals()
+
+        setup_logging(config)
+
+        command = full_command[0]
+        command_args = full_command[1:]
+
+        log.info(f"Starting rffmpeg as {command} with args: {' '.join(command_args)}")
+
+        target_hid, target_hostname, target_servername = get_target_host(config)
+
+        if not target_hostname or target_hostname == "localhost":
+            ret = run_local_command(config, command, command_args)
+        else:
+            ret = run_remote_command(
+                config,
+                target_hid,
+                target_hostname,
+                target_servername,
+                command,
+                command_args,
+                stderr_as_stdout=stderr_as_stdout
+            )
+
+        cleanup()
+        if ret.returncode == 0:
+            log.info(f"Finished rffmpeg with return code {ret.returncode}")
+        else:
+            log.error(f"Finished rffmpeg with return code {ret.returncode}")
+        exit(ret.returncode)
+
+    rffmpeg_click.add_command(rffmpeg_click_run)
 
     @click.command(name="log", short_help="View the rffmpeg log.")
     @click.option(

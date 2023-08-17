@@ -350,6 +350,7 @@ def get_target_host(config, ffmpeg_args):
     target_hostname = None
     target_servername = None
     target_has_transcodes = "/transcodes/" in ' '.join(ffmpeg_args)
+    bad_host_check = "-version" in ' '.join(ffmpeg_args)
     # For each host in the mapping, let's determine if it is suitable
     for hid, host in host_mappings.items():
         log.debug(f"Trying host ID {hid} '{host['hostname']}'")
@@ -357,8 +358,11 @@ def get_target_host(config, ffmpeg_args):
         if host["current_state"] == "bad":
             log.debug(f"Host previously marked bad by PID {host['marking_pid']}")
             continue
+        # Don't change host when checking for bad hosts
+        if bad_host_check is True:
+            pass
         # Streams should NOT be played form "Filme-Server"
-        if host["hostname"] == "Filme-Server" and target_has_transcodes:
+        elif host["hostname"] == "Filme-Server" and target_has_transcodes:
             log.debug(f"Skipping Filme-Server, since transcodes are requested")
             continue
         # Every host other than "Filme-Server" should ONLY transcode streams

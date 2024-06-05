@@ -187,9 +187,10 @@ def load_config():
     # Parse the keys from the remote group
     config["remote_user"] = config_remote.get("user", "")
 # id_rsa is not needed because I define all hosts in /root/.ssh
-#    config["remote_args"] = config_remote.get(
+    config["remote_args"] = config_remote.get(
 #        "args", ["-i", "/var/lib/jellyfin/.ssh/id_rsa"]
-#    )
+        "args", []
+    )
     if config["remote_args"] is None:
         config["remote_args"] = []
     config["persist_time"] = config_remote.get("persist", 300)

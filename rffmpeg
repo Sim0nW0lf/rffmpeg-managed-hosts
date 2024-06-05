@@ -205,10 +205,10 @@ def load_config():
         "ffprobe", "/usr/lib/jellyfin-ffmpeg/ffprobe"
     )
     config["fallback_ffmpeg_command"] = config_commands.get(
-        "fallback_ffmpeg", "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+        "fallback_ffmpeg", "/usr/lib/jellyfin-ffmpeg/fallback-ffmpeg"
     )
     config["fallback_ffprobe_command"] = config_commands.get(
-        "fallback_ffprobe", "/usr/lib/jellyfin-ffmpeg/ffprobe"
+        "fallback_ffprobe", "/usr/lib/jellyfin-ffmpeg/fallback-ffprobe"
     )
 
     # Set the database path
